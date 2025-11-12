@@ -1,0 +1,16 @@
+project_id = "lptihhjkcditbozcnxrp"
+
+[functions.upload-document]
+verify_jwt = false
+
+[functions.get-job-status]
+verify_jwt = false
+
+[functions.get-rules]
+verify_jwt = false
+
+[functions.export-rules]
+verify_jwt = false
+
+[functions.get-stats]
+verify_jwt = false
