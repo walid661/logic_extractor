@@ -1,4 +1,14 @@
 import { createClient } from "npm:@supabase/supabase-js@2";
+import { RecursiveCharacterTextSplitter } from "npm:langchain@0.1.20/text_splitter";
+import {
+  logger,
+  generateRequestId,
+  calculateCost,
+  type ExtractionStartedContext,
+  type ExtractionCompletedContext,
+  type ErrorContext,
+} from "../_shared/logger.ts";
+import { checkRateLimit } from "../_shared/rate-limit.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -15,30 +25,36 @@ interface RuleExtracted {
 }
 
 // ============================================================================
-// CONFIGURATION DES OPTIMISATIONS DE PERFORMANCE - PHASE 2
+// CONFIGURATION DES OPTIMISATIONS DE PERFORMANCE - P0 Quick Wins
 // ============================================================================
-// Phase 2 : Optimisations agressives pour vitesse maximale et visibilité
 const CONFIG = {
   // Parallélisation augmentée
-  BATCH_SIZE: 4,                      // Augmenté de 3 à 4 chunks par batch
-  MAX_CONCURRENT_BATCHES: 3,          // Augmenté de 2 à 3 batches en parallèle
+  BATCH_SIZE: 4,                      // 4 chunks par batch
+  MAX_CONCURRENT_BATCHES: 3,          // 3 batches en parallèle
 
-  // Pauses réduites au minimum
-  PAUSE_BETWEEN_GROUPS_MS: 100,       // Réduit de 300ms à 100ms
+  // Pauses supprimées - retry gère le rate limiting
+  PAUSE_BETWEEN_GROUPS_MS: 0,         // Supprimé : pas de pause artificielle
 
   // Progression en temps réel - mise à jour CHAQUE batch
-  UPDATE_PROGRESS_EVERY_N_BATCHES: 1, // Mise à jour après CHAQUE batch pour visibilité maximale
+  UPDATE_PROGRESS_EVERY_N_BATCHES: 1, // Mise à jour après CHAQUE batch
 
   // Délais retry optimisés
-  RETRY_DELAY_BASE_MS: 300,           // Réduit de 500ms à 300ms
-  RETRY_DELAY_MAX_MS: 8000,           // Réduit de 10s à 8s
-  RETRY_DELAY_SERVER_ERROR_MAX_MS: 3000, // Réduit de 5s à 3s
+  RETRY_DELAY_BASE_MS: 300,
+  RETRY_DELAY_MAX_MS: 8000,
+  RETRY_DELAY_SERVER_ERROR_MAX_MS: 3000,
+
+  // LangChain chunking config
+  CHUNK_SIZE: 1500,                   // Token-aware chunking
+  CHUNK_OVERLAP: 200,                 // Overlap pour contexte
 };
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
     return new Response(null, { headers: corsHeaders });
   }
+
+  const requestId = generateRequestId();
+  const startTime = Date.now();
 
   try {
     // Get user from authorization header
@@ -62,7 +78,7 @@ Deno.serve(async (req) => {
 
     // Get authenticated user
     const { data: { user }, error: userError } = await supabaseClient.auth.getUser();
-    
+
     if (userError || !user) {
       return new Response(
         JSON.stringify({ error: 'Unauthorized' }),
@@ -70,9 +86,19 @@ Deno.serve(async (req) => {
       );
     }
 
+    // Rate limiting check
+    const rateLimitOk = await checkRateLimit(user.id, "upload");
+    if (!rateLimitOk) {
+      logger.warn({ requestId, userId: user.id }, "Rate limit exceeded");
+      return new Response(
+        JSON.stringify({ error: 'Rate limit exceeded. Please try again later.' }),
+        { status: 429, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      );
+    }
+
     const formData = await req.formData();
     const file = formData.get('file') as File;
-    
+
     if (!file) {
       return new Response(
         JSON.stringify({ error: 'No file provided' }),
@@ -80,7 +106,7 @@ Deno.serve(async (req) => {
       );
     }
 
-    console.log(`Processing file: ${file.name}, size: ${file.size}`);
+    logger.info({ requestId, fileName: file.name, fileSize: file.size, userId: user.id }, "Processing file upload");
 
     // Save document metadata with user_id
     const { data: document, error: docError } = await supabaseClient
@@ -97,7 +123,7 @@ Deno.serve(async (req) => {
       .single();
 
     if (docError) {
-      console.error('Error creating document:', docError);
+      logger.error({ requestId, error: docError.message }, "Error creating document");
       return new Response(
         JSON.stringify({ error: 'Failed to create document' }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -117,7 +143,7 @@ Deno.serve(async (req) => {
       .single();
 
     if (jobError) {
-      console.error('Error creating job:', jobError);
+      logger.error({ requestId, documentId: document.id, error: jobError.message }, "Error creating job");
       return new Response(
         JSON.stringify({ error: 'Failed to create job' }),
         { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -146,15 +172,15 @@ Deno.serve(async (req) => {
           throw new Error('Empty or unreadable PDF content');
         }
 
-        console.log(`Extracted ${text.length} characters from ${numPages} pages`);
-        
+        logger.info({ requestId, documentId: document.id, textLength: text.length, pages: numPages }, "PDF parsed successfully");
+
         await supabaseClient
           .from('jobs')
           .update({ progress: 30 })
           .eq('id', job.id);
 
         // Extract rules using OpenAI (avec jobId pour progression)
-        const rules = await extractRulesFromText(text, numPages, supabaseClient, job.id);
+        const rules = await extractRulesFromText(text, numPages, supabaseClient, job.id, requestId);
         
         await supabaseClient
           .from('jobs')
@@ -180,7 +206,7 @@ Deno.serve(async (req) => {
             .insert(rulesData);
 
           if (rulesError) {
-            console.error('Error inserting rules:', rulesError);
+            logger.error({ requestId, documentId: document.id, error: rulesError.message }, "Error inserting rules");
             await supabaseClient
               .from('jobs')
               .update({ status: 'error', error: rulesError.message })
@@ -195,19 +221,28 @@ Deno.serve(async (req) => {
           .update({ pages: numPages, status: 'done' })
           .eq('id', document.id);
 
-        // Generate summary for the document
-        await generateSummaryForDocument(document.id, rules, supabaseClient);
-
-        // Mark job as done
+        // Mark job as done (summary will be generated asynchronously)
         await supabaseClient
           .from('jobs')
           .update({ status: 'done', progress: 100 })
           .eq('id', job.id);
 
-        console.log(`Successfully processed ${rules.length} rules from ${file.name}`);
+        logger.info({ requestId, documentId: document.id, rulesExtracted: rules.length }, "Document processing completed");
+
+        // Fire-and-forget: trigger summary generation asynchronously
+        triggerSummaryGeneration(document.id, rules).catch(err =>
+          logger.error({ requestId, documentId: document.id, error: err.message }, "Failed to trigger summary generation")
+        );
       } catch (error) {
-        console.error('Background processing error:', error);
-        
+        logger.error({
+          event: "error",
+          requestId,
+          documentId: document.id,
+          errorType: error instanceof Error ? error.constructor.name : "UnknownError",
+          errorMessage: error instanceof Error ? error.message : String(error),
+          stack: error instanceof Error ? error.stack : undefined,
+        } as ErrorContext, "Background processing error");
+
         // Update document status to error
         await supabaseClient
           .from('documents')
@@ -216,9 +251,9 @@ Deno.serve(async (req) => {
 
         await supabaseClient
           .from('jobs')
-          .update({ 
-            status: 'error', 
-            error: error instanceof Error ? error.message : 'Unknown error' 
+          .update({
+            status: 'error',
+            error: error instanceof Error ? error.message : 'Unknown error'
           })
           .eq('id', job.id);
       }
@@ -230,7 +265,13 @@ Deno.serve(async (req) => {
     );
 
   } catch (error) {
-    console.error('Upload error:', error);
+    logger.error({
+      event: "error",
+      requestId,
+      errorType: error instanceof Error ? error.constructor.name : "UnknownError",
+      errorMessage: error instanceof Error ? error.message : String(error),
+    } as Partial<ErrorContext>, "Upload error");
+
     return new Response(
       JSON.stringify({ error: error instanceof Error ? error.message : 'Unknown error' }),
       { status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
@@ -238,63 +279,35 @@ Deno.serve(async (req) => {
   }
 });
 
-async function generateSummaryForDocument(documentId: string, rules: any[], supabaseClient: any) {
-  const apiKey = Deno.env.get('OPENAI_API_KEY');
-  if (!apiKey) {
-    console.error('OPENAI_API_KEY not configured for summary generation');
+/**
+ * Trigger summary generation asynchronously (fire-and-forget)
+ * Calls the dedicated generate-summary Edge Function
+ */
+async function triggerSummaryGeneration(documentId: string, rules: RuleExtracted[]): Promise<void> {
+  const functionsUrl = Deno.env.get('SUPABASE_URL')?.replace('/rest/v1', '/functions/v1') ||
+                       'http://localhost:54321/functions/v1';
+  const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
+
+  if (!serviceRoleKey) {
+    logger.warn({ documentId }, "SUPABASE_SERVICE_ROLE_KEY not configured, skipping summary generation");
     return;
   }
 
-  if (rules.length === 0) {
-    console.log('No rules to summarize');
-    return;
-  }
-
-  const summaryPrompt = `
-Tu es un assistant qui résume des règles métier extraites d'un document.
-Voici la liste des règles extraites :
-
-${rules.map((r, i) => `${i + 1}. ${r.text}`).join("\n")}
-
-Résume en 3 phrases maximum la logique métier principale du document,
-en restant factuel et synthétique, sans ajout d'information externe.
-  `;
-
-  try {
-    const response = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'Tu résumes des documents métier.' },
-          { role: 'user', content: summaryPrompt }
-        ],
-      }),
-    });
-
-    if (!response.ok) {
-      console.error(`OpenAI API error for summary: ${response.status}`);
-      return;
-    }
-
-    const data = await response.json();
-    const summary = data?.choices?.[0]?.message?.content?.trim() ?? null;
-
-    if (summary) {
-      await supabaseClient
-        .from('documents')
-        .update({ summary })
-        .eq('id', documentId);
-      
-      console.log(`Summary generated for document ${documentId}`);
-    }
-  } catch (error) {
-    console.error('Error generating summary:', error);
-  }
+  // Fire-and-forget HTTP call (no await on the response body)
+  fetch(`${functionsUrl}/generate-summary`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${serviceRoleKey}`,
+    },
+    body: JSON.stringify({
+      documentId,
+      rules: rules.map(r => ({ text: r.text }))
+    })
+  }).catch(err => {
+    // Silently log but don't throw (fire-and-forget)
+    logger.debug({ documentId, error: err.message }, "Summary trigger failed (non-blocking)");
+  });
 }
 
 /**
@@ -329,15 +342,15 @@ async function callOpenAIWithRetry(
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.error(`OpenAI API error (batch ${batchId}, attempt ${attempt + 1}):`, response.status);
-        
+        logger.warn({ batchId, attempt: attempt + 1, status: response.status }, "OpenAI API error");
+
         // Rate limiting - délai optimisé mais sûr
         if (response.status === 429) {
           const waitTime = Math.min(
             Math.pow(2, attempt) * CONFIG.RETRY_DELAY_BASE_MS,
             CONFIG.RETRY_DELAY_MAX_MS
           );
-          console.log(`Rate limited, waiting ${waitTime}ms before retry...`);
+          logger.info({ batchId, waitTime }, "Rate limited, waiting before retry");
           await new Promise(r => setTimeout(r, waitTime));
           continue;
         }
@@ -370,7 +383,7 @@ async function callOpenAIWithRetry(
       try {
         parsed = JSON.parse(content);
       } catch (err) {
-        console.error(`JSON parsing error (batch ${batchId}, attempt ${attempt + 1}):`, err);
+        logger.error({ batchId, attempt: attempt + 1, error: err instanceof Error ? err.message : String(err) }, "JSON parsing error");
         if (attempt < maxRetries - 1) {
           await new Promise(r => setTimeout(r, CONFIG.RETRY_DELAY_BASE_MS));
           continue; // Retry en cas d'erreur de parsing
@@ -379,13 +392,13 @@ async function callOpenAIWithRetry(
       }
 
       if (!parsed.rules || !Array.isArray(parsed.rules)) {
-        console.warn(`Invalid response format (batch ${batchId}):`, parsed);
+        logger.warn({ batchId, parsed }, "Invalid response format");
         return [];
       }
 
       return parsed.rules as RuleExtracted[];
     } catch (error) {
-      console.error(`Error processing batch ${batchId} (attempt ${attempt + 1}):`, error);
+      logger.error({ batchId, attempt: attempt + 1, error: error instanceof Error ? error.message : String(error) }, "Error processing batch");
       if (attempt < maxRetries - 1) {
         const waitTime = Math.min(
           Math.pow(2, attempt) * CONFIG.RETRY_DELAY_BASE_MS,
@@ -414,17 +427,18 @@ async function extractRulesFromText(
   text: string,
   totalPages: number,
   supabaseClient?: any,
-  jobId?: string
+  jobId?: string,
+  requestId?: string
 ): Promise<RuleExtracted[]> {
   const apiKey = Deno.env.get('OPENAI_API_KEY');
   if (!apiKey) {
-    console.error('OPENAI_API_KEY not configured');
+    logger.error({ requestId }, 'OPENAI_API_KEY not configured');
     return [];
   }
-  
+
   // Monitoring de performance
   const startTime = Date.now();
-  console.log(`[PERF] Starting extraction for ${totalPages} pages`);
+  logger.info({ requestId, totalPages }, "[PERF] Starting extraction");
   
   // Prompt système amélioré avec instructions plus précises
   const SYSTEM_PROMPT = `
@@ -467,29 +481,17 @@ Règles strictes :
 - Le texte de la règle doit être extrait tel quel du document (pas de reformulation)
 `;
 
-  // Découpage amélioré : par paragraphes et sections
-  const paragraphs = text.split(/\n\s*\n/).filter(p => p.trim().length > 50);
-  
-  // Grouper les paragraphes en chunks intelligents (max 3000 caractères)
-  const chunks: Array<{ text: string; startIndex: number }> = [];
-  let currentChunk = '';
-  let startIndex = 0;
-  
-  for (let i = 0; i < paragraphs.length; i++) {
-    const para = paragraphs[i].trim();
-    if (currentChunk.length + para.length > 3000 && currentChunk.length > 0) {
-      chunks.push({ text: currentChunk, startIndex });
-      currentChunk = para;
-      startIndex = i;
-    } else {
-      currentChunk += (currentChunk ? '\n\n' : '') + para;
-    }
-  }
-  if (currentChunk.length > 0) {
-    chunks.push({ text: currentChunk, startIndex });
-  }
+  // Token-aware chunking with LangChain
+  const textSplitter = new RecursiveCharacterTextSplitter({
+    chunkSize: CONFIG.CHUNK_SIZE,
+    chunkOverlap: CONFIG.CHUNK_OVERLAP,
+    separators: ["\n\n", "\n", ". ", " ", ""]
+  });
 
-  console.log(`[PERF] Created ${chunks.length} chunks from ${paragraphs.length} paragraphs`);
+  const chunkTexts = await textSplitter.splitText(text);
+  const chunks = chunkTexts.map((text, index) => ({ text, startIndex: index }));
+
+  logger.info({ requestId, chunks: chunks.length }, "[PERF] Created chunks with LangChain");
 
   const allRules: RuleExtracted[] = [];
   
@@ -508,7 +510,16 @@ Règles strictes :
 
   const totalBatches = batches.length;
   let processedBatches = 0;
-  console.log(`[PERF] Processing ${totalBatches} batches with ${maxConcurrentBatches} concurrent batches`);
+
+  logger.info({
+    event: "extraction_started",
+    requestId: requestId || "unknown",
+    documentId: jobId || "unknown",
+    jobId: jobId || "unknown",
+    chunks: chunks.length,
+    batches: totalBatches,
+    totalPages
+  } as ExtractionStartedContext, `[PERF] Processing ${totalBatches} batches with ${maxConcurrentBatches} concurrent`);
 
   // Traiter les batches par groupes parallèles avec pause réduite
   for (let i = 0; i < batches.length; i += maxConcurrentBatches) {
@@ -532,7 +543,7 @@ Règles strictes :
         // Mise à jour de progression (tous les N batches) avec logs détaillés
         if (supabaseClient && jobId && processedBatches % CONFIG.UPDATE_PROGRESS_EVERY_N_BATCHES === 0) {
           const progress = 30 + Math.floor((processedBatches / totalBatches) * 40); // 30% -> 70%
-          console.log(`[PROGRESS] Batch ${processedBatches}/${totalBatches} completed (${progress}%)`);
+          logger.info({ requestId, jobId, progress, batchesProcessed: processedBatches, totalBatches }, `[PROGRESS] Batch ${processedBatches}/${totalBatches} completed`);
           await supabaseClient
             .from('jobs')
             .update({ progress })
@@ -541,7 +552,7 @@ Règles strictes :
 
         return rules;
       } catch (error) {
-        console.error(`Error in batch ${batch.index}:`, error);
+        logger.error({ requestId, batchIndex: batch.index, error: error instanceof Error ? error.message : String(error) }, "Error in batch");
         processedBatches++;
         return [];
       }
@@ -549,11 +560,8 @@ Règles strictes :
 
     const results = await Promise.all(batchPromises);
     allRules.push(...results.flat());
-    
-    // Pause réduite entre groupes (utilise CONFIG)
-    if (i + maxConcurrentBatches < batches.length) {
-      await new Promise(r => setTimeout(r, CONFIG.PAUSE_BETWEEN_GROUPS_MS));
-    }
+
+    // No more pauses between groups - retry logic handles rate limiting
   }
 
   // Validation et nettoyage des règles
@@ -575,39 +583,52 @@ Règles strictes :
       }
     }));
 
-  // Dédoublonnage optimisé avec Set et hash (Phase 1)
+  // Déduplication O(n) avec SHA-256 hash
   const uniqueRules: RuleExtracted[] = [];
-  const seenTextHashes = new Set<string>();
-  
+  const seenHashes = new Set<string>();
+
   for (const rule of validatedRules) {
-    // Créer un hash simple du texte pour comparaison rapide
-    // Prendre les 10 premiers mots significatifs (>3 caractères)
-    const textHash = rule.text.toLowerCase()
+    // Normalize text: remove punctuation, lowercase, take first 15 significant words
+    const normalized = rule.text.toLowerCase()
       .replace(/[^\w\s]/g, '')
       .split(/\s+/)
       .filter(w => w.length > 3)
-      .slice(0, 10)
+      .slice(0, 15)
       .join(' ');
-    
-    // Vérifier si on a déjà vu un texte similaire
-    let isDuplicate = false;
-    for (const seenHash of seenTextHashes) {
-      const similarity = calculateSimilarity(seenHash, textHash);
-      if (similarity > 0.85) {
-        isDuplicate = true;
-        break;
-      }
-    }
-    
-    if (!isDuplicate) {
-      seenTextHashes.add(textHash);
+
+    // Create SHA-256 hash for deterministic deduplication
+    const encoder = new TextEncoder();
+    const data = encoder.encode(normalized);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+    if (!seenHashes.has(hashHex)) {
+      seenHashes.add(hashHex);
       uniqueRules.push(rule);
     }
   }
 
   const duration = Date.now() - startTime;
-  console.log(`[PERF] Extraction completed in ${duration}ms: ${uniqueRules.length} unique rules from ${allRules.length} total rules`);
-  console.log(`[PERF] Average: ${totalBatches > 0 ? (duration / totalBatches).toFixed(0) : 0}ms per batch`);
-  
+  const estimatedCost = calculateCost(
+    text.length * 0.4, // Approximation: 1 char ≈ 0.4 tokens
+    uniqueRules.length * 100, // Avg 100 tokens per rule output
+    "gpt-4o-mini"
+  );
+
+  logger.info({
+    event: "extraction_completed",
+    requestId: requestId || "unknown",
+    documentId: jobId || "unknown",
+    jobId: jobId || "unknown",
+    durationMs: duration,
+    rulesExtracted: allRules.length,
+    uniqueRules: uniqueRules.length,
+    costUsd: estimatedCost,
+    cacheHit: false // Placeholder for future cache implementation
+  } as ExtractionCompletedContext, `[PERF] Extraction completed in ${duration}ms`);
+
+  logger.info({ requestId, avgPerBatch: totalBatches > 0 ? (duration / totalBatches).toFixed(0) : 0 }, "[PERF] Average per batch");
+
   return uniqueRules;
 }
