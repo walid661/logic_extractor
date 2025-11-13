@@ -204,6 +204,39 @@ done
 # Doc 5: 5000ms (80% cache)
 ```
 
+### Test 5: Tests Automatisés (Nouveaux)
+
+**Tests unitaires (Deno):**
+```bash
+# Tests du module cache avec mocks
+cd supabase/functions/upload-documents/extraction
+deno test --allow-env --allow-net cache.test.ts
+
+# Avec coverage
+deno test --allow-env --allow-net --coverage=coverage cache.test.ts
+deno coverage coverage
+```
+
+**Tests d'intégration (Script répété):**
+```bash
+# Prerequisites
+export SUPABASE_URL="https://your-project.supabase.co"
+export SUPABASE_ANON_KEY="your-anon-key"
+export SUPABASE_AUTH_TOKEN="your-jwt"  # From browser localStorage
+
+# Run cache effectiveness test (3 iterations by default)
+deno run -A scripts/eval/repeat-cache-check.ts fixtures/sample-20p.pdf 3
+
+# Validation automatique:
+# ✅ Latency reduction ≥30%
+# ✅ Cache hit rate ≥50% on warm cache
+# ✅ Cost per doc ≤$0.008
+```
+
+**Documentation des tests:**
+- Voir `supabase/functions/upload-documents/extraction/README_TESTS.md` pour détails complets
+- Exemples de sorties, troubleshooting, et procédures manuelles
+
 ## 🚀 Déploiement
 
 ### 1. Déployer service PyMuPDF
