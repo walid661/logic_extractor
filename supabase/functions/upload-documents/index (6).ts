@@ -10,6 +10,7 @@ import {
 } from "../_shared/logger.ts";
 import { checkRateLimit } from "../_shared/rate-limit.ts";
 import { getCachedRules, cacheRules, getCacheStats } from "./extraction/cache.ts";
+import { CONFIG, CACHE_BACKEND, PARSE_CONFIG, EXACT_REUSE_ENABLED } from "./config.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -25,29 +26,7 @@ interface RuleExtracted {
   source: { page: number; section: string | null };
 }
 
-// ============================================================================
-// CONFIGURATION DES OPTIMISATIONS DE PERFORMANCE - P0 Quick Wins
-// ============================================================================
-const CONFIG = {
-  // Parallélisation augmentée
-  BATCH_SIZE: 4,                      // 4 chunks par batch
-  MAX_CONCURRENT_BATCHES: 3,          // 3 batches en parallèle
-
-  // Pauses supprimées - retry gère le rate limiting
-  PAUSE_BETWEEN_GROUPS_MS: 0,         // Supprimé : pas de pause artificielle
-
-  // Progression en temps réel - mise à jour CHAQUE batch
-  UPDATE_PROGRESS_EVERY_N_BATCHES: 1, // Mise à jour après CHAQUE batch
-
-  // Délais retry optimisés
-  RETRY_DELAY_BASE_MS: 300,
-  RETRY_DELAY_MAX_MS: 8000,
-  RETRY_DELAY_SERVER_ERROR_MAX_MS: 3000,
-
-  // LangChain chunking config
-  CHUNK_SIZE: 1500,                   // Token-aware chunking
-  CHUNK_OVERLAP: 200,                 // Overlap pour contexte
-};
+// CONFIG imported from config.ts (centralized configuration)
 
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
@@ -163,6 +142,101 @@ Deno.serve(async (req) => {
         const arrayBuffer = await file.arrayBuffer();
         const buffer = new Uint8Array(arrayBuffer);
 
+        // Calculate file hash for exact reuse detection
+        const fileHash = await calculateFileHash(buffer);
+
+        // Update document with file_hash
+        await supabaseClient
+          .from('documents')
+          .update({ file_hash: fileHash })
+          .eq('id', document.id);
+
+        logger.info({
+          requestId,
+          documentId: document.id,
+          fileHash,
+          exact_reuse_enabled: EXACT_REUSE_ENABLED,
+        }, "File hash calculated");
+
+        // Check for exact reuse: if same file was already processed by this user
+        if (EXACT_REUSE_ENABLED) {
+          const { data: existingDocs, error: existingError } = await supabaseClient
+            .from('documents')
+            .select('id')
+            .eq('user_id', user.id)
+            .eq('file_hash', fileHash)
+            .eq('status', 'done')
+            .neq('id', document.id) // Exclude current document
+            .limit(1);
+
+          if (!existingError && existingDocs && existingDocs.length > 0) {
+            const sourceDocId = existingDocs[0].id;
+
+            logger.info({
+              requestId,
+              documentId: document.id,
+              sourceDocId,
+              fileHash,
+            }, "Exact file match found - reusing existing rules");
+
+            // Copy rules from existing document
+            const { data: existingRules, error: rulesError } = await supabaseClient
+              .from('rules')
+              .select('*')
+              .eq('document_id', sourceDocId);
+
+            if (!rulesError && existingRules && existingRules.length > 0) {
+              // Copy pages from source document
+              const { data: sourceDoc } = await supabaseClient
+                .from('documents')
+                .select('pages, summary')
+                .eq('id', sourceDocId)
+                .single();
+
+              // Insert copied rules with new document_id
+              const copiedRules = existingRules.map(rule => ({
+                document_id: document.id,
+                document_name: document.name,
+                text: rule.text,
+                conditions: rule.conditions,
+                domain: rule.domain,
+                tags: rule.tags,
+                confidence: rule.confidence,
+                source_page: rule.source_page,
+                source_sect: rule.source_sect,
+              }));
+
+              await supabaseClient.from('rules').insert(copiedRules);
+
+              // Update document to done with pages and summary from source
+              await supabaseClient
+                .from('documents')
+                .update({
+                  status: 'done',
+                  pages: sourceDoc?.pages || null,
+                  summary: sourceDoc?.summary || null,
+                })
+                .eq('id', document.id);
+
+              // Mark job as done
+              await supabaseClient
+                .from('jobs')
+                .update({ status: 'done', progress: 100 })
+                .eq('id', job.id);
+
+              logger.info({
+                requestId,
+                documentId: document.id,
+                rulesReused: existingRules.length,
+                sourceDocId,
+              }, "Rules reused successfully - skipping extraction");
+
+              return; // Exit early - no extraction needed
+            }
+          }
+        }
+
+        // No exact reuse - proceed with normal extraction
         // Parse PDF (PyMuPDF service with fallback to pdf-parse)
         const parsedPDF = await parsePDF(buffer, requestId);
         const text = parsedPDF.text;
@@ -318,6 +392,15 @@ async function triggerSummaryGeneration(documentId: string, rules: RuleExtracted
 }
 
 /**
+ * Calculate SHA-256 hash of file buffer for exact reuse detection
+ */
+async function calculateFileHash(buffer: Uint8Array): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
  * Parse PDF with PyMuPDF service (fallback to pdf-parse if unavailable)
  */
 interface ParsedPDF {
@@ -331,30 +414,28 @@ async function parsePDF(
   buffer: Uint8Array,
   requestId?: string
 ): Promise<ParsedPDF> {
-  const PARSE_SERVICE_URL = Deno.env.get("PARSE_SERVICE_URL");
-  const PARSE_SERVICE_TOKEN = Deno.env.get("PARSE_SERVICE_TOKEN");
-  const PARSE_TIMEOUT_MS = 8000;
-  const MAX_RETRIES = 2;
+  // Use centralized config from config.ts
+  const { SERVICE_URL, SERVICE_TOKEN, TIMEOUT_MS, MAX_RETRIES } = PARSE_CONFIG;
 
   // Try PyMuPDF service if configured
-  if (PARSE_SERVICE_URL) {
+  if (SERVICE_URL) {
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       const startTime = Date.now();
 
       try {
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), PARSE_TIMEOUT_MS);
+        const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
         const formData = new FormData();
         const blob = new Blob([buffer], { type: "application/pdf" });
         formData.append("file", blob, "document.pdf");
 
         const headers: Record<string, string> = {};
-        if (PARSE_SERVICE_TOKEN) {
-          headers["Authorization"] = `Bearer ${PARSE_SERVICE_TOKEN}`;
+        if (SERVICE_TOKEN) {
+          headers["Authorization"] = `Bearer ${SERVICE_TOKEN}`;
         }
 
-        const response = await fetch(`${PARSE_SERVICE_URL}/parse`, {
+        const response = await fetch(`${SERVICE_URL}/parse`, {
           method: "POST",
           body: formData,
           headers,
@@ -646,8 +727,9 @@ Règles strictes :
     jobId: jobId || "unknown",
     chunks: chunks.length,
     batches: totalBatches,
-    totalPages
-  } as ExtractionStartedContext, `[PERF] Processing ${totalBatches} batches with ${maxConcurrentBatches} concurrent`);
+    totalPages,
+    cache_backend: CACHE_BACKEND, // "none" for MVP (no semantic cache)
+  } as ExtractionStartedContext, `[PERF] Processing ${totalBatches} batches with ${maxConcurrentBatches} concurrent (cache: ${CACHE_BACKEND})`);
 
   // Traiter les batches par groupes parallèles avec pause réduite
   for (let i = 0; i < batches.length; i += maxConcurrentBatches) {
@@ -771,16 +853,17 @@ Règles strictes :
     rulesExtracted: allRules.length,
     uniqueRules: uniqueRules.length,
     costUsd: estimatedCost,
-    cacheHit: cacheStats.hitRate > 0, // True if any cache hits
-    cacheHitRate: cacheStats.hitRate,
-    cacheHits: cacheStats.hits,
-    cacheMisses: cacheStats.misses,
-  } as ExtractionCompletedContext, `[PERF] Extraction completed in ${duration}ms`);
+    cache_backend: CACHE_BACKEND, // "none" for MVP
+    cacheHit: cacheStats.hitRate > 0, // Always false when cache disabled
+    cacheHitRate: cacheStats.hitRate, // Always 0 when cache disabled
+    cacheHits: cacheStats.hits, // Always 0 when cache disabled
+    cacheMisses: cacheStats.misses, // Always 0 when cache disabled
+  } as ExtractionCompletedContext, `[PERF] Extraction completed in ${duration}ms (cache: ${CACHE_BACKEND})`);
 
   logger.info({
     requestId,
     avgPerBatch: totalBatches > 0 ? (duration / totalBatches).toFixed(0) : 0,
-    cacheHitRate: `${(cacheStats.hitRate * 100).toFixed(1)}%`,
+    cache_backend: CACHE_BACKEND,
   }, "[PERF] Average per batch");
 
   return uniqueRules;
