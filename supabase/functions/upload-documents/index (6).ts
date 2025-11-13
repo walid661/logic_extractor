@@ -15,25 +15,24 @@ interface RuleExtracted {
 }
 
 // ============================================================================
-// CONFIGURATION DES OPTIMISATIONS DE PERFORMANCE - PHASE 1
+// CONFIGURATION DES OPTIMISATIONS DE PERFORMANCE - PHASE 2
 // ============================================================================
-// Phase 1 : Optimisations sans risque (gain estimé 35-40%)
-// Ajustez ces valeurs selon vos besoins et votre budget OpenAI
+// Phase 2 : Optimisations agressives pour vitesse maximale et visibilité
 const CONFIG = {
-  // Parallélisation (inchangé pour Phase 1)
-  BATCH_SIZE: 3,                      // Nombre de chunks par batch
-  MAX_CONCURRENT_BATCHES: 2,          // Nombre de batches traités en parallèle
-  
-  // Pauses entre groupes (réduit pour accélérer)
-  PAUSE_BETWEEN_GROUPS_MS: 300,       // Réduit de 1000ms à 300ms
-  
-  // Progression temps réel (mise à jour tous les N batches)
-  UPDATE_PROGRESS_EVERY_N_BATCHES: 3, // Mettre à jour tous les 3 batches
-  
-  // Délais retry (optimisés mais sûrs)
-  RETRY_DELAY_BASE_MS: 500,           // Délai de base pour retry (au lieu de 1000ms)
-  RETRY_DELAY_MAX_MS: 10000,          // Max pour rate limit (10s au lieu de 30s)
-  RETRY_DELAY_SERVER_ERROR_MAX_MS: 5000, // Max pour erreurs serveur (5s au lieu de 30s)
+  // Parallélisation augmentée
+  BATCH_SIZE: 4,                      // Augmenté de 3 à 4 chunks par batch
+  MAX_CONCURRENT_BATCHES: 3,          // Augmenté de 2 à 3 batches en parallèle
+
+  // Pauses réduites au minimum
+  PAUSE_BETWEEN_GROUPS_MS: 100,       // Réduit de 300ms à 100ms
+
+  // Progression en temps réel - mise à jour CHAQUE batch
+  UPDATE_PROGRESS_EVERY_N_BATCHES: 1, // Mise à jour après CHAQUE batch pour visibilité maximale
+
+  // Délais retry optimisés
+  RETRY_DELAY_BASE_MS: 300,           // Réduit de 500ms à 300ms
+  RETRY_DELAY_MAX_MS: 8000,           // Réduit de 10s à 8s
+  RETRY_DELAY_SERVER_ERROR_MAX_MS: 3000, // Réduit de 5s à 3s
 };
 
 Deno.serve(async (req) => {
@@ -527,18 +526,19 @@ Règles strictes :
           userContent,
           `batch-${batch.index}`
         );
-        
+
         processedBatches++;
-        
-        // Mise à jour de progression (tous les N batches)
+
+        // Mise à jour de progression (tous les N batches) avec logs détaillés
         if (supabaseClient && jobId && processedBatches % CONFIG.UPDATE_PROGRESS_EVERY_N_BATCHES === 0) {
           const progress = 30 + Math.floor((processedBatches / totalBatches) * 40); // 30% -> 70%
+          console.log(`[PROGRESS] Batch ${processedBatches}/${totalBatches} completed (${progress}%)`);
           await supabaseClient
             .from('jobs')
             .update({ progress })
             .eq('id', jobId);
         }
-        
+
         return rules;
       } catch (error) {
         console.error(`Error in batch ${batch.index}:`, error);

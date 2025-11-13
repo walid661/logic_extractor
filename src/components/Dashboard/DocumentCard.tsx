@@ -2,6 +2,7 @@ import { useNavigate } from "react-router-dom";
 import { CheckCircle2, Loader2, AlertCircle, FileText, FileSpreadsheet } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 
 interface DocumentCardProps {
   id: string;
@@ -10,15 +11,17 @@ interface DocumentCardProps {
   created_at: string;
   rulesCount?: number;
   avgConfidence?: number;
+  progress?: number;
 }
 
-export const DocumentCard = ({ 
-  id, 
-  name, 
-  status, 
-  created_at, 
+export const DocumentCard = ({
+  id,
+  name,
+  status,
+  created_at,
   rulesCount,
-  avgConfidence 
+  avgConfidence,
+  progress
 }: DocumentCardProps) => {
   const navigate = useNavigate();
 
@@ -29,7 +32,7 @@ export const DocumentCard = ({
         return (
           <Badge variant="outline" className="bg-blue-50 text-blue-700 border-blue-200">
             <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-            Extraction en cours…
+            {progress !== undefined ? `Extraction ${progress}%` : 'Extraction en cours…'}
           </Badge>
         );
       case 'done':
@@ -101,6 +104,13 @@ export const DocumentCard = ({
               </span>
             )}
           </div>
+
+          {/* Progress bar for processing documents */}
+          {(status === 'processing' || status === 'queued') && progress !== undefined && (
+            <div className="mt-3">
+              <Progress value={progress} className="h-2" />
+            </div>
+          )}
         </div>
       </div>
     </Card>
