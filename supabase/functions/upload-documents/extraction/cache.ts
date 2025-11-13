@@ -1,9 +1,13 @@
 /**
  * Semantic cache for rule extraction using Upstash Vector + OpenAI embeddings
  *
- * Feature flagged: only active if UPSTASH_VECTOR_URL is set
+ * MVP DECISION: DISABLED BY DEFAULT for confidentiality/compliance reasons
  *
- * Architecture:
+ * Feature flag: SEMANTIC_CACHE_ENABLED (default: false)
+ * - false: All functions return null/no-op (NLP-only extraction, no embeddings)
+ * - true: Enable semantic cache (requires UPSTASH_VECTOR_URL, UPSTASH_VECTOR_TOKEN)
+ *
+ * Architecture (when enabled):
  * - Embed chunk text with text-embedding-3-small (OpenAI)
  * - Query Upstash Vector index (cosine similarity)
  * - Return cached rules if similarity > CACHE_THRESHOLD (0.93)
@@ -15,6 +19,7 @@
  */
 
 import { logger } from "../../_shared/logger.ts";
+import { SEMANTIC_CACHE_ENABLED } from "../config.ts";
 
 interface RuleExtracted {
   text: string;
@@ -39,8 +44,7 @@ interface VectorQueryResult {
   metadata: CacheMetadata;
 }
 
-// Configuration
-const CACHE_ENABLED = Deno.env.get("CACHE_ENABLED") !== "false"; // Enabled by default if env vars present
+// Configuration (only read when SEMANTIC_CACHE_ENABLED=true)
 const UPSTASH_VECTOR_URL = Deno.env.get("UPSTASH_VECTOR_URL");
 const UPSTASH_VECTOR_TOKEN = Deno.env.get("UPSTASH_VECTOR_TOKEN");
 const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
@@ -55,9 +59,13 @@ let totalRequests = 0; // Total cache lookups for periodic logging
 
 /**
  * Check if cache is available
+ * Returns false by default unless SEMANTIC_CACHE_ENABLED=true AND all env vars present
  */
 function isCacheAvailable(): boolean {
-  return CACHE_ENABLED && !!UPSTASH_VECTOR_URL && !!UPSTASH_VECTOR_TOKEN && !!OPENAI_API_KEY;
+  if (!SEMANTIC_CACHE_ENABLED) {
+    return false; // MVP: Cache disabled by default
+  }
+  return !!UPSTASH_VECTOR_URL && !!UPSTASH_VECTOR_TOKEN && !!OPENAI_API_KEY;
 }
 
 /**
