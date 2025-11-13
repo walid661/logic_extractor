@@ -9,6 +9,7 @@ import {
   type ErrorContext,
 } from "../_shared/logger.ts";
 import { checkRateLimit } from "../_shared/rate-limit.ts";
+import { getCachedRules, cacheRules, getCacheStats } from "./extraction/cache.ts";
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -161,18 +162,24 @@ Deno.serve(async (req) => {
 
         const arrayBuffer = await file.arrayBuffer();
         const buffer = new Uint8Array(arrayBuffer);
-        
-        // Extract text from PDF using pdf-parse
-        const pdfParse = await import('npm:pdf-parse@1.1.1');
-        const pdfData = await pdfParse.default(buffer);
-        const text = pdfData.text;
-        const numPages = pdfData.numpages;
+
+        // Parse PDF (PyMuPDF service with fallback to pdf-parse)
+        const parsedPDF = await parsePDF(buffer, requestId);
+        const text = parsedPDF.text;
+        const numPages = parsedPDF.pages;
 
         if (!text || text.trim().length === 0) {
           throw new Error('Empty or unreadable PDF content');
         }
 
-        logger.info({ requestId, documentId: document.id, textLength: text.length, pages: numPages }, "PDF parsed successfully");
+        logger.info({
+          requestId,
+          documentId: document.id,
+          textLength: text.length,
+          pages: numPages,
+          parse_backend: parsedPDF.parseBackend,
+          parse_duration_ms: parsedPDF.parseDurationMs,
+        }, "PDF parsed successfully");
 
         await supabaseClient
           .from('jobs')
@@ -308,6 +315,127 @@ async function triggerSummaryGeneration(documentId: string, rules: RuleExtracted
     // Silently log but don't throw (fire-and-forget)
     logger.debug({ documentId, error: err.message }, "Summary trigger failed (non-blocking)");
   });
+}
+
+/**
+ * Parse PDF with PyMuPDF service (fallback to pdf-parse if unavailable)
+ */
+interface ParsedPDF {
+  text: string;
+  pages: number;
+  parseBackend: "pymupdf" | "pdf-parse";
+  parseDurationMs: number;
+}
+
+async function parsePDF(
+  buffer: Uint8Array,
+  requestId?: string
+): Promise<ParsedPDF> {
+  const PARSE_SERVICE_URL = Deno.env.get("PARSE_SERVICE_URL");
+  const PARSE_SERVICE_TOKEN = Deno.env.get("PARSE_SERVICE_TOKEN");
+  const PARSE_TIMEOUT_MS = 8000;
+  const MAX_RETRIES = 2;
+
+  // Try PyMuPDF service if configured
+  if (PARSE_SERVICE_URL) {
+    for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+      const startTime = Date.now();
+
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), PARSE_TIMEOUT_MS);
+
+        const formData = new FormData();
+        const blob = new Blob([buffer], { type: "application/pdf" });
+        formData.append("file", blob, "document.pdf");
+
+        const headers: Record<string, string> = {};
+        if (PARSE_SERVICE_TOKEN) {
+          headers["Authorization"] = `Bearer ${PARSE_SERVICE_TOKEN}`;
+        }
+
+        const response = await fetch(`${PARSE_SERVICE_URL}/parse`, {
+          method: "POST",
+          body: formData,
+          headers,
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeoutId);
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          logger.warn({
+            requestId,
+            attempt: attempt + 1,
+            status: response.status,
+            error: errorText,
+          }, "PyMuPDF service error");
+          continue; // Retry or fallback
+        }
+
+        const data = await response.json();
+        const pages = data.pages || [];
+        const text = pages.map((p: any) => p.text).join("\n\n===PAGE_SEPARATOR===\n\n");
+        const parseDuration = Date.now() - startTime;
+
+        logger.info({
+          requestId,
+          parse_backend: "pymupdf",
+          parse_duration_ms: parseDuration,
+          pages: data.total_pages,
+          textLength: text.length,
+        }, "PDF parsed with PyMuPDF service");
+
+        return {
+          text,
+          pages: data.total_pages,
+          parseBackend: "pymupdf",
+          parseDurationMs: parseDuration,
+        };
+      } catch (error) {
+        logger.warn({
+          requestId,
+          attempt: attempt + 1,
+          error: error instanceof Error ? error.message : String(error),
+        }, "PyMuPDF service call failed");
+
+        if (attempt === MAX_RETRIES - 1) {
+          logger.info({ requestId }, "Falling back to pdf-parse");
+          break; // Fall through to pdf-parse
+        }
+      }
+    }
+  }
+
+  // Fallback: pdf-parse
+  const startTime = Date.now();
+  try {
+    const pdfParse = await import("npm:pdf-parse@1.1.1");
+    const pdfData = await pdfParse.default(buffer);
+    const parseDuration = Date.now() - startTime;
+
+    logger.info({
+      requestId,
+      parse_backend: "pdf-parse",
+      parse_duration_ms: parseDuration,
+      pages: pdfData.numpages,
+      textLength: pdfData.text.length,
+    }, "PDF parsed with pdf-parse (fallback)");
+
+    return {
+      text: pdfData.text,
+      pages: pdfData.numpages,
+      parseBackend: "pdf-parse",
+      parseDurationMs: parseDuration,
+    };
+  } catch (error) {
+    logger.error({
+      requestId,
+      error: error instanceof Error ? error.message : String(error),
+    }, "PDF parsing failed completely");
+    throw new Error("Failed to parse PDF with both PyMuPDF and pdf-parse");
+  }
 }
 
 /**
@@ -526,17 +654,32 @@ Règles strictes :
     const batchGroup = batches.slice(i, i + maxConcurrentBatches);
     
     const batchPromises = batchGroup.map(async (batch) => {
-      const userContent = batch.chunks.map((c, idx) => 
+      const userContent = batch.chunks.map((c, idx) =>
         `## Chunk ${batch.index + idx + 1}/${chunks.length}\n${c.text}`
       ).join('\n\n---\n\n');
 
       try {
-        const rules = await callOpenAIWithRetry(
-          apiKey,
-          SYSTEM_PROMPT,
-          userContent,
-          `batch-${batch.index}`
-        );
+        // Try cache first
+        const cachedRules = await getCachedRules(userContent, requestId);
+
+        let rules: RuleExtracted[];
+        if (cachedRules) {
+          rules = cachedRules;
+          logger.debug({ requestId, batchIndex: batch.index }, "Using cached rules");
+        } else {
+          // Cache miss - call LLM
+          rules = await callOpenAIWithRetry(
+            apiKey,
+            SYSTEM_PROMPT,
+            userContent,
+            `batch-${batch.index}`
+          );
+
+          // Cache extracted rules (fire-and-forget)
+          cacheRules(userContent, rules, requestId, jobId, batch.index).catch((err) =>
+            logger.debug({ requestId, error: err.message }, "Cache upsert failed (non-blocking)")
+          );
+        }
 
         processedBatches++;
 
@@ -616,6 +759,9 @@ Règles strictes :
     "gpt-4o-mini"
   );
 
+  // Get cache statistics
+  const cacheStats = getCacheStats();
+
   logger.info({
     event: "extraction_completed",
     requestId: requestId || "unknown",
@@ -625,10 +771,17 @@ Règles strictes :
     rulesExtracted: allRules.length,
     uniqueRules: uniqueRules.length,
     costUsd: estimatedCost,
-    cacheHit: false // Placeholder for future cache implementation
+    cacheHit: cacheStats.hitRate > 0, // True if any cache hits
+    cacheHitRate: cacheStats.hitRate,
+    cacheHits: cacheStats.hits,
+    cacheMisses: cacheStats.misses,
   } as ExtractionCompletedContext, `[PERF] Extraction completed in ${duration}ms`);
 
-  logger.info({ requestId, avgPerBatch: totalBatches > 0 ? (duration / totalBatches).toFixed(0) : 0 }, "[PERF] Average per batch");
+  logger.info({
+    requestId,
+    avgPerBatch: totalBatches > 0 ? (duration / totalBatches).toFixed(0) : 0,
+    cacheHitRate: `${(cacheStats.hitRate * 100).toFixed(1)}%`,
+  }, "[PERF] Average per batch");
 
   return uniqueRules;
 }
