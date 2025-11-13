@@ -51,6 +51,7 @@ const MAX_EMBEDDING_CHARS = 8000; // Truncate to avoid token limit
 // Stats (in-memory, per-process)
 let cacheHits = 0;
 let cacheMisses = 0;
+let totalRequests = 0; // Total cache lookups for periodic logging
 
 /**
  * Check if cache is available
@@ -172,6 +173,8 @@ export async function getCachedRules(
 
     if (results.length === 0 || results[0].score < CACHE_THRESHOLD) {
       cacheMisses++;
+      totalRequests++;
+      logPeriodicStats(); // Log stats every 100 requests
       logger.debug({
         requestId,
         cache_hit: false,
@@ -183,6 +186,8 @@ export async function getCachedRules(
 
     // Cache hit!
     cacheHits++;
+    totalRequests++;
+    logPeriodicStats(); // Log stats every 100 requests
     const cachedRules = results[0].metadata.rules;
 
     logger.info({
@@ -196,6 +201,8 @@ export async function getCachedRules(
     return cachedRules;
   } catch (error) {
     cacheMisses++;
+    totalRequests++;
+    logPeriodicStats(); // Log stats every 100 requests
     logger.error({
       requestId,
       error: error instanceof Error ? error.message : String(error),
@@ -274,6 +281,23 @@ export async function cacheRules(
       error: error instanceof Error ? error.message : String(error),
       event: "cache_error",
     }, "Cache upsert error (non-blocking)");
+  }
+}
+
+/**
+ * Log cache stats every 100 requests (sliding window)
+ */
+function logPeriodicStats(): void {
+  if (totalRequests % 100 === 0 && totalRequests > 0) {
+    const stats = getCacheStats();
+    logger.info({
+      event: "cache_stats_periodic",
+      total_requests: totalRequests,
+      cache_hits: stats.hits,
+      cache_misses: stats.misses,
+      cache_hit_rate: `${(stats.hitRate * 100).toFixed(1)}%`,
+      hit_rate_decimal: stats.hitRate,
+    }, `[CACHE] Stats at ${totalRequests} requests: ${(stats.hitRate * 100).toFixed(1)}% hit rate`);
   }
 }
 
