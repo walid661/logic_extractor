@@ -365,8 +365,11 @@ Deno.serve(async (req) => {
  * Calls the dedicated generate-summary Edge Function
  */
 async function triggerSummaryGeneration(documentId: string, rules: RuleExtracted[]): Promise<void> {
-  const functionsUrl = Deno.env.get('SUPABASE_URL')?.replace('/rest/v1', '/functions/v1') ||
-                       'http://localhost:54321/functions/v1';
+  const supabaseUrl = Deno.env.get('SUPABASE_URL') || 'http://localhost:54321';
+  // Ensure we build the functions URL correctly regardless of SUPABASE_URL format
+  const functionsUrl = supabaseUrl.includes('/rest/v1')
+    ? supabaseUrl.replace('/rest/v1', '/functions/v1')
+    : `${supabaseUrl}/functions/v1`;
   const serviceRoleKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY');
 
   if (!serviceRoleKey) {
