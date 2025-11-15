@@ -77,7 +77,7 @@ export const UploadDialog = ({ open, onOpenChange }: UploadDialogProps) => {
         const formData = new FormData();
         formData.append("file", file);
 
-        const { data, error } = await supabase.functions.invoke("upload-document", {
+        const { data, error } = await supabase.functions.invoke("upload-documents", {
           body: formData,
           headers: {
             Authorization: `Bearer ${session.access_token}`,
