@@ -374,21 +374,24 @@ async function triggerSummaryGeneration(documentId: string, rules: RuleExtracted
     return;
   }
 
-  // Fire-and-forget HTTP call (no await on the response body)
-  fetch(`${functionsUrl}/generate-summary`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${serviceRoleKey}`,
-    },
-    body: JSON.stringify({
-      documentId,
-      rules: rules.map(r => ({ text: r.text }))
-    })
-  }).catch(err => {
-    // Silently log but don't throw (fire-and-forget)
-    logger.debug({ documentId, error: err.message }, "Summary trigger failed (non-blocking)");
-  });
+  // Await fetch initiation to ensure it starts before function shutdown
+  try {
+    await fetch(`${functionsUrl}/generate-summary`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${serviceRoleKey}`,
+      },
+      body: JSON.stringify({
+        documentId,
+        rules: rules.map(r => ({ text: r.text }))
+      })
+    });
+    logger.info({ documentId }, "Summary generation triggered successfully");
+  } catch (err) {
+    // Log error but don't throw (non-blocking)
+    logger.warn({ documentId, error: err instanceof Error ? err.message : String(err) }, "Summary trigger failed (non-blocking)");
+  }
 }
 
 /**
