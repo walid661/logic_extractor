@@ -17,7 +17,7 @@
  *
  * @default false
  */
-export const SEMANTIC_CACHE_ENABLED = (Deno.env.get("SEMANTIC_CACHE_ENABLED") ?? "false") === "true";
+export const SEMANTIC_CACHE_ENABLED = true;
 
 // ============================================================================
 // PERFORMANCE & PARALLELIZATION CONFIG (PR #1 Quick Wins)

@@ -22,6 +22,7 @@ from typing import List, Dict
 from io import BytesIO
 
 import fitz  # PyMuPDF
+import pdfplumber
 from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -69,18 +70,25 @@ def verify_auth(authorization: str = Header(None)):
 
 
 def parse_pdf_bytes(pdf_bytes: bytes) -> ParseResponse:
-    """Parse PDF bytes using PyMuPDF"""
+    """Parse PDF bytes using PyMuPDF for text and pdfplumber for tables"""
     start_time = time.time()
 
     try:
-        # Open PDF from bytes
+        # Open PDF from bytes with PyMuPDF
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        
+        # Open PDF from bytes with pdfplumber for tables
+        pdf_plumber = None
+        try:
+            pdf_plumber = pdfplumber.open(BytesIO(pdf_bytes))
+        except Exception as e:
+            logger.warning(f"Failed to initialize pdfplumber: {e}")
 
         pages = []
         for page_num in range(len(doc)):
             page = doc.load_page(page_num)
 
-            # Extract text preserving reading order
+            # Extract text preserving reading order (PyMuPDF)
             blocks = page.get_text("dict")["blocks"]
             text_parts = []
 
@@ -91,9 +99,36 @@ def parse_pdf_bytes(pdf_bytes: bytes) -> ParseResponse:
                             text_parts.append(span["text"])
 
             page_text = " ".join(text_parts)
+            
+            # Extract tables (pdfplumber)
+            if pdf_plumber and page_num < len(pdf_plumber.pages):
+                try:
+                    plumber_page = pdf_plumber.pages[page_num]
+                    tables = plumber_page.extract_tables()
+                    
+                    if tables:
+                        page_text += "\n\n=== EXTRACTED TABLES ===\n"
+                        for table in tables:
+                            # Filter out empty tables
+                            if not table: continue
+                            
+                            # Convert to simple markdown table
+                            for row in table:
+                                # Handle None and newlines in cells
+                                clean_row = [
+                                    str(cell).replace("\n", " ") if cell is not None else "" 
+                                    for cell in row
+                                ]
+                                page_text += "| " + " | ".join(clean_row) + " |\n"
+                            page_text += "\n"
+                except Exception as e:
+                    logger.warning(f"Table extraction failed for page {page_num + 1}: {e}")
+
             pages.append(PageResult(page=page_num + 1, text=page_text))
 
         doc.close()
+        if pdf_plumber:
+            pdf_plumber.close()
 
         duration_ms = int((time.time() - start_time) * 1000)
 

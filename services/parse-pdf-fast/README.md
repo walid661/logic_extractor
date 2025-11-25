@@ -5,6 +5,7 @@ Microservice HTTP pour extraction PDF rapide via PyMuPDF (5× plus rapide que pd
 ## Fonctionnalités
 
 - **Parsing rapide:** PyMuPDF (fitz) - 400ms au lieu de 2000ms pour 20 pages
+- **Extraction de tableaux:** pdfplumber - Intégration pour extraction structurée des tableaux
 - **API simple:** POST /parse avec multipart ou raw body
 - **Auth:** Bearer token optionnel
 - **Logs JSON:** Compatible avec stack observabilité moderne

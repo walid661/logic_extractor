@@ -262,7 +262,7 @@ Deno.serve(async (req) => {
 
         // Extract rules using OpenAI (avec jobId pour progression)
         const rules = await extractRulesFromText(text, numPages, supabaseClient, job.id, requestId);
-        
+
         await supabaseClient
           .from('jobs')
           .update({ progress: 70 })
@@ -342,7 +342,7 @@ Deno.serve(async (req) => {
 
     return new Response(
       JSON.stringify({ documentId: document.id, jobId: job.id }),
-      { headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
+      { status: 202, headers: { ...corsHeaders, 'Content-Type': 'application/json' } }
     );
 
   } catch (error) {
@@ -569,7 +569,7 @@ async function callOpenAIWithRetry(
           await new Promise(r => setTimeout(r, waitTime));
           continue;
         }
-        
+
         // Erreur serveur - retry avec backoff optimisé
         if (response.status >= 500 && attempt < maxRetries - 1) {
           const waitTime = Math.min(
@@ -579,13 +579,13 @@ async function callOpenAIWithRetry(
           await new Promise(r => setTimeout(r, waitTime));
           continue;
         }
-        
+
         return []; // Erreur non récupérable
       }
 
       const data = await response.json();
       const content = data.choices?.[0]?.message?.content;
-      
+
       if (!content) {
         if (attempt < maxRetries - 1) {
           await new Promise(r => setTimeout(r, CONFIG.RETRY_DELAY_BASE_MS));
@@ -623,7 +623,7 @@ async function callOpenAIWithRetry(
       }
     }
   }
-  
+
   return []; // Tous les retries ont échoué
 }
 
@@ -654,7 +654,7 @@ async function extractRulesFromText(
   // Monitoring de performance
   const startTime = Date.now();
   logger.info({ requestId, totalPages }, "[PERF] Starting extraction");
-  
+
   // Prompt système amélioré avec instructions plus précises
   const SYSTEM_PROMPT = `
 Tu es un expert en analyse de documents métier et extraction de règles.
@@ -709,11 +709,11 @@ Règles strictes :
   logger.info({ requestId, chunks: chunks.length }, "[PERF] Created chunks with LangChain");
 
   const allRules: RuleExtracted[] = [];
-  
+
   // Configuration de parallélisation (utilise CONFIG)
   const batchSize = CONFIG.BATCH_SIZE;
   const maxConcurrentBatches = CONFIG.MAX_CONCURRENT_BATCHES;
-  
+
   // Créer tous les batches
   const batches: Array<{ chunks: typeof chunks; index: number }> = [];
   for (let i = 0; i < chunks.length; i += batchSize) {
@@ -740,7 +740,7 @@ Règles strictes :
   // Traiter les batches par groupes parallèles avec pause réduite
   for (let i = 0; i < batches.length; i += maxConcurrentBatches) {
     const batchGroup = batches.slice(i, i + maxConcurrentBatches);
-    
+
     const batchPromises = batchGroup.map(async (batch) => {
       const userContent = batch.chunks.map((c, idx) =>
         `## Chunk ${batch.index + idx + 1}/${chunks.length}\n${c.text}`

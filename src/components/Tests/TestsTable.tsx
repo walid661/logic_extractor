@@ -16,7 +16,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Search } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Search, ThumbsUp, ThumbsDown } from "lucide-react";
+import { supabase } from "@/integrations/supabase/client";
+import { useToast } from "@/hooks/use-toast";
 
 interface TestCase {
   id: string;
@@ -25,26 +28,32 @@ interface TestCase {
   inputs: any;
   expected: any;
   created_at: string;
+  feedback?: "up" | "down" | "none";
 }
 
 interface TestsTableProps {
   testCases: TestCase[];
+  documentId: string;
+  onExport?: (format: "playwright" | "gherkin") => void;
 }
 
-export const TestsTable = ({ testCases }: TestsTableProps) => {
+export const TestsTable = ({ testCases: initialTestCases, documentId, onExport }: TestsTableProps) => {
+  const [testCases, setTestCases] = useState<TestCase[]>(initialTestCases);
   const [search, setSearch] = useState("");
   const [ruleFilter, setRuleFilter] = useState<string>("all");
+  const [exportFormat, setExportFormat] = useState<"playwright" | "gherkin">("playwright");
+  const { toast } = useToast();
 
   // Extract unique rule IDs
   const uniqueRuleIds = Array.from(new Set(testCases.map(tc => tc.rule_id)));
 
   // Filter test cases
   const filteredTests = testCases.filter((test) => {
-    const matchesSearch = 
+    const matchesSearch =
       test.notes?.toLowerCase().includes(search.toLowerCase()) ||
       JSON.stringify(test.inputs).toLowerCase().includes(search.toLowerCase()) ||
       JSON.stringify(test.expected).toLowerCase().includes(search.toLowerCase());
-    
+
     const matchesRule = ruleFilter === "all" || test.rule_id === ruleFilter;
 
     return matchesSearch && matchesRule;
@@ -56,10 +65,38 @@ export const TestsTable = ({ testCases }: TestsTableProps) => {
     return JSON.stringify(data, null, 2);
   };
 
+  const handleExport = () => {
+    if (onExport) {
+      onExport(exportFormat);
+    }
+  };
+
+  const handleFeedback = async (testId: string, value: "up" | "down") => {
+    const { error } = await supabase
+      .from("test_cases")
+      .update({ feedback: value })
+      .eq("id", testId);
+
+    if (error) {
+      toast({
+        title: "Erreur",
+        description: error.message,
+        variant: "destructive",
+      });
+    } else {
+      // Optimistic UI update
+      setTestCases((prev) =>
+        prev.map((t) => (t.id === testId ? { ...t, feedback: value } : t))
+      );
+      toast({ title: "Feedback enregistré" });
+    }
+  };
+
   return (
     <div className="space-y-4">
-      {/* Filters */}
-      <div className="flex flex-col sm:flex-row gap-4">
+      {/* Filters + Export */}
+      <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center">
+        {/* Search */}
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
@@ -69,6 +106,8 @@ export const TestsTable = ({ testCases }: TestsTableProps) => {
             className="pl-10"
           />
         </div>
+
+        {/* Rule filter */}
         <Select value={ruleFilter} onValueChange={setRuleFilter}>
           <SelectTrigger className="w-full sm:w-64">
             <SelectValue placeholder="Filtrer par règle" />
@@ -82,6 +121,25 @@ export const TestsTable = ({ testCases }: TestsTableProps) => {
             ))}
           </SelectContent>
         </Select>
+
+        {/* Export format selector */}
+        <Select
+          value={exportFormat}
+          onValueChange={(v) => setExportFormat(v as any)}
+        >
+          <SelectTrigger className="w-full sm:w-48">
+            <SelectValue placeholder="Format d'export" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="playwright">Playwright (TS)</SelectItem>
+            <SelectItem value="gherkin">Gherkin (Feature)</SelectItem>
+          </SelectContent>
+        </Select>
+
+        {/* Export button */}
+        <Button onClick={handleExport} variant="outline">
+          Exporter les tests
+        </Button>
       </div>
 
       {/* Table */}
@@ -93,13 +151,14 @@ export const TestsTable = ({ testCases }: TestsTableProps) => {
               <TableHead>Règle ID</TableHead>
               <TableHead>Entrées</TableHead>
               <TableHead>Résultat attendu</TableHead>
+              <TableHead>Feedback</TableHead>
               <TableHead>Date de création</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {filteredTests.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={5} className="text-center text-muted-foreground py-8">
+                <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
                   Aucun cas de test trouvé
                 </TableCell>
               </TableRow>
@@ -123,6 +182,24 @@ export const TestsTable = ({ testCases }: TestsTableProps) => {
                     <pre className="text-xs bg-muted p-2 rounded overflow-auto max-h-24">
                       {formatJson(test.expected)}
                     </pre>
+                  </TableCell>
+                  <TableCell className="flex items-center gap-2">
+                    <Button
+                      variant={test.feedback === "up" ? "default" : "ghost"}
+                      size="icon"
+                      onClick={() => handleFeedback(test.id, "up")}
+                      className={test.feedback === "up" ? "bg-green-600 hover:bg-green-700" : ""}
+                    >
+                      <ThumbsUp className={`h-4 w-4 ${test.feedback === "up" ? "text-white" : "text-green-600"}`} />
+                    </Button>
+                    <Button
+                      variant={test.feedback === "down" ? "default" : "ghost"}
+                      size="icon"
+                      onClick={() => handleFeedback(test.id, "down")}
+                      className={test.feedback === "down" ? "bg-red-600 hover:bg-red-700" : ""}
+                    >
+                      <ThumbsDown className={`h-4 w-4 ${test.feedback === "down" ? "text-white" : "text-red-600"}`} />
+                    </Button>
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
                     {new Date(test.created_at).toLocaleDateString('fr-FR', {

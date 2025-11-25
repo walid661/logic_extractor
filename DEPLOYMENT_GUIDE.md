@@ -8,24 +8,26 @@
 
 ## 📋 ÉTAPES À SUIVRE (par toi)
 
-### **ÉTAPE 1 : Appliquer la migration SQL** (5 min)
+### **ÉTAPE 1 : Appliquer les migrations SQL** (5 min)
 
 1. Va sur https://supabase.com/dashboard/project/pjkgjmkbrjpagksaznpk/sql
 2. Clique **New query**
-3. Copie-colle ce SQL :
+3. Copie-colle ce SQL (cumulé des Phases 3 & 4) :
 
 ```sql
--- Add file_hash column to documents table
+-- 1. (Phase 4) Add file_hash column to documents table for exact reuse
 ALTER TABLE public.documents
 ADD COLUMN IF NOT EXISTS file_hash TEXT;
 
--- Create index on (user_id, file_hash) for efficient exact reuse lookup
 CREATE INDEX IF NOT EXISTS idx_documents_user_filehash
 ON public.documents(user_id, file_hash);
 
--- Add comment explaining the purpose
 COMMENT ON COLUMN public.documents.file_hash IS
 'SHA-256 hash of PDF file content for exact reuse detection';
+
+-- 2. (Phase 3) Add feedback column to test_cases table
+ALTER TABLE test_cases 
+ADD COLUMN IF NOT EXISTS feedback text DEFAULT 'none' CHECK (feedback IN ('up','down','none'));
 ```
 
 4. Clique **RUN** → Tu devrais voir "Success"
@@ -36,110 +38,54 @@ COMMENT ON COLUMN public.documents.file_hash IS
 
 1. Va sur https://supabase.com/dashboard/project/pjkgjmkbrjpagksaznpk/settings/functions
 2. Scroll jusqu'à **Secrets**
-3. Ajoute ces secrets (clique **Add secret** pour chacun) :
+3. Vérifie/Ajoute ces secrets :
 
 | Name | Value |
 |------|-------|
-| `OPENAI_API_KEY` | `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` |
-| `SEMANTIC_CACHE_ENABLED` | `false` |
-| `EXACT_REUSE_ENABLED` | `true` |
-
-**Note** : `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` sont déjà disponibles automatiquement.
+| `OPENAI_API_KEY` | `sk-proj-...` (Ta clé OpenAI) |
+| `SEMANTIC_CACHE_ENABLED` | `true` (Activé en Phase 1) |
+| `EXACT_REUSE_ENABLED` | `true` (Activé en Phase 4) |
 
 ---
 
-### **ÉTAPE 3 : Déployer les Edge Functions via GitHub** (Option Recommandée)
+### **ÉTAPE 3 : Déployer les Edge Functions** (5 min)
 
-#### **Option A : Via Supabase CLI (si tu l'as installé)**
-
-```bash
-# Installer Supabase CLI (si pas déjà fait)
-# macOS
-brew install supabase/tap/supabase
-
-# Windows
-scoop bucket add supabase https://github.com/supabase/scoop-bucket.git
-scoop install supabase
-
-# Linux
-brew install supabase/tap/supabase
-```
-
-Puis :
+Tu dois déployer les fonctions modifiées et la nouvelle fonction d'export.
 
 ```bash
-cd /path/to/logic_extractor
-
-# Login
+# Login (si nécessaire)
 supabase login
 
-# Link project
-supabase link --project-ref pjkgjmkbrjpagksaznpk
-
-# Deploy functions
+# Deploy all updated functions
 supabase functions deploy upload-documents
+supabase functions deploy generate-tests
+supabase functions deploy export-tests
 supabase functions deploy generate-summary
 ```
 
 ---
 
-#### **Option B : Via Dashboard (si pas de CLI)**
+### **ÉTAPE 4 : Mettre à jour le Service Python** (Phase 4)
 
-**upload-documents :**
+Le service de parsing PDF a été mis à jour avec `pdfplumber`. Il doit être reconstruit.
 
-1. Va sur https://supabase.com/dashboard/project/pjkgjmkbrjpagksaznpk/functions
-2. Clique **Create a new function**
-3. Name: `upload-documents`
-4. Copie TOUT le contenu de `supabase/functions/upload-documents/index.ts` (29590 caractères)
-5. **IMPORTANT** : Ajoute aussi les imports depuis :
-   - `supabase/functions/_shared/logger.ts`
-   - `supabase/functions/_shared/rate-limit.ts`
-   - `supabase/functions/upload-documents/config.ts`
-   - `supabase/functions/upload-documents/extraction/cache.ts`
-6. Clique **Deploy function**
-
-**generate-summary :**
-
-1. Même procédure pour `supabase/functions/generate-summary/index.ts`
-
-**⚠️ Problème** : Cette option est fastidieuse car tu dois copier/coller manuellement tous les fichiers et leurs dépendances.
-
----
-
-#### **Option C : GitHub Integration (RECOMMANDÉ)** ⭐
-
-1. Push ton code sur GitHub :
-   ```bash
-   git push origin claude/mvp-no-semantic-cache-011CV5azfg3uuQVz3XEvqFHV
-   ```
-
-2. Va sur https://supabase.com/dashboard/project/pjkgjmkbrjpagksaznpk/settings/integrations
-
-3. Active **GitHub Integration**
-
-4. Configure auto-deploy depuis ta branche
-
-5. Supabase déploiera automatiquement les Edge Functions à chaque push
-
----
-
-### **ÉTAPE 4 : Vérifier le déploiement** (2 min)
-
-1. Va sur https://supabase.com/dashboard/project/pjkgjmkbrjpagksaznpk/functions
-
-2. Tu devrais voir :
-   - ✅ `upload-documents` (deployed)
-   - ✅ `generate-summary` (deployed)
-
-3. Teste avec curl :
-
+**Si tu utilises Docker localement :**
 ```bash
-curl -X POST https://pjkgjmkbrjpagksaznpk.supabase.co/functions/v1/upload-documents \
-  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBqa2dqbWticmpwYWdrc2F6bnBrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjMxMTkwODksImV4cCI6MjA3ODY5NTA4OX0._b3gCfOBHizlXoIxv1wNvAgajv5JmgeJYkVL2V_Z740" \
-  -F "file=@test.pdf"
+cd services/parse-pdf-fast
+docker build -t parse-pdf-fast .
+docker run -p 8080:8080 -e PARSE_SERVICE_TOKEN="ton-token" parse-pdf-fast
 ```
 
-Tu devrais recevoir `{"documentId":"...", "jobId":"..."}`
+**Si tu utilises Cloud Run / Fly.io :**
+Relance la commande de déploiement (voir README du service) pour reconstruire l'image avec les nouvelles dépendances.
+
+---
+
+### **ÉTAPE 5 : Vérifier le déploiement** (2 min)
+
+1. **Test Upload:** Upload un fichier. Vérifie qu'il passe (Status 202 puis Done).
+2. **Test Feedback:** Va sur un document, génère des tests, et clique sur le pouce haut/bas.
+3. **Test Export:** Clique sur "Exporter les tests".
 
 ---
 
