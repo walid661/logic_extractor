@@ -15,9 +15,16 @@ interface Rule {
   confidence: number;
 }
 
+interface Job {
+  document_id: string;
+  progress: number;
+  status: string;
+}
+
 export const RecentDocumentsList = () => {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [rulesStats, setRulesStats] = useState<Record<string, { count: number; avgConfidence: number }>>({});
+  const [jobProgress, setJobProgress] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(true);
 
   const fetchDocuments = async () => {
@@ -33,7 +40,7 @@ export const RecentDocumentsList = () => {
     }
 
     setDocuments((data || []) as Document[]);
-    
+
     // Fetch rules stats for done documents
     if (data && data.length > 0) {
       const doneDocIds = data.filter(d => d.status === 'done').map(d => d.id);
@@ -61,6 +68,26 @@ export const RecentDocumentsList = () => {
           });
 
           setRulesStats(stats);
+        }
+      }
+
+      // Fetch job progress for processing/queued documents
+      const processingDocIds = data.filter(d => d.status === 'processing' || d.status === 'queued').map(d => d.id);
+      if (processingDocIds.length > 0) {
+        const { data: jobsData } = await supabase
+          .from('jobs')
+          .select('document_id, progress, status')
+          .in('document_id', processingDocIds)
+          .order('created_at', { ascending: false });
+
+        if (jobsData) {
+          const progress: Record<string, number> = {};
+          (jobsData as Job[]).forEach(job => {
+            if (!progress[job.document_id]) {
+              progress[job.document_id] = job.progress || 0;
+            }
+          });
+          setJobProgress(progress);
         }
       }
     }
@@ -92,7 +119,7 @@ export const RecentDocumentsList = () => {
     };
   }, []);
 
-  // Auto-refresh when there are processing documents
+  // Auto-refresh when there are processing documents - faster polling for better UX
   useEffect(() => {
     const hasProcessing = documents.some(
       doc => doc.status === 'processing' || doc.status === 'queued'
@@ -102,7 +129,7 @@ export const RecentDocumentsList = () => {
 
     const interval = setInterval(() => {
       fetchDocuments();
-    }, 5000); // Refresh every 5 seconds
+    }, 2000); // Refresh every 2 seconds (reduced from 5s for better visibility)
 
     return () => clearInterval(interval);
   }, [documents]);
@@ -137,6 +164,7 @@ export const RecentDocumentsList = () => {
           created_at={doc.created_at}
           rulesCount={rulesStats[doc.id]?.count}
           avgConfidence={rulesStats[doc.id]?.avgConfidence}
+          progress={jobProgress[doc.id]}
         />
       ))}
     </div>
